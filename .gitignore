@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+#密钥
+.env
+
+# Node
+node_modules/
+dist/
+
+# 数据库文件
+*.db
+
+# 生成的PPT和数据文件
+data/ppts/
+data/chroma_db/
+
+# IDE
+.idea/
+.vscode/
+
+# 系统文件
+Thumbs.db
+Desktop.ini

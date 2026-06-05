@@ -1,0 +1,31 @@
+[project]
+name = "a3-learning-agent"
+version = "1.0.0"
+description = "第十五届中国软件杯A3赛题 - 基于大模型的个性化资源生成与学习多智能体系统"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.6",
+    "uvicorn[standard]>=0.34.0",
+    "pydantic>=2.10.4",
+    "chromadb>=0.5.23",
+    "sentence-transformers>=3.3.1",
+    "python-multipart>=0.0.19",
+    "httpx>=0.28.1",
+    "markdown>=3.7",
+    "python-pptx>=1.0.2",
+    "pygments>=2.20.0",
+    "pillow>=12.2.0",
+    "python-docx>=1.2.0",
+]
+
+[dependency-groups]
+dev = []
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[tool.uv.workspace]
+members = [
+    "demo",
+]
