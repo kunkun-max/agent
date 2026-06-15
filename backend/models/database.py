@@ -83,6 +83,15 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_resources_user ON learning_resources(user_id);
         CREATE INDEX IF NOT EXISTS idx_profiles_user ON student_profiles(user_id);
         CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_messages(user_id);
+
+        CREATE TABLE IF NOT EXISTS evaluations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            eval_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_eval_user ON evaluations(user_id);
     """)
     conn.commit()
     conn.close()
@@ -288,15 +297,24 @@ def save_chat_message(user_id: int, role: str, text: str) -> dict:
         conn.close()
 
 
-def get_chat_history(user_id: int, limit: int = 50) -> list[dict]:
-    """获取用户最近N条聊天记录"""
+def get_chat_history(user_id: int, limit: int = 30, offset: int = 0) -> tuple[list[dict], int]:
+    """获取用户聊天记录（分页）
+
+    Returns:
+        (messages, total) — messages按时间正序，total为总条数
+    """
     conn = get_db()
     try:
+        total = conn.execute(
+            "SELECT COUNT(*) as c FROM chat_messages WHERE user_id = ?", (user_id,)
+        ).fetchone()['c']
+        # 倒序取最新N条，再反转为正序（实现"从尾部分页"）
         rows = conn.execute(
-            "SELECT id, role, text, created_at FROM chat_messages WHERE user_id = ? ORDER BY id ASC LIMIT ?",
-            (user_id, limit),
+            "SELECT id, role, text, created_at FROM chat_messages WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
         ).fetchall()
-        return [{"id": str(r["id"]), "text": r["text"], "role": r["role"]} for r in rows]
+        messages = [{"id": str(r["id"]), "text": r["text"], "role": r["role"]} for r in reversed(rows)]
+        return messages, total
     finally:
         conn.close()
 
@@ -307,5 +325,55 @@ def clear_chat_history(user_id: int):
     try:
         conn.execute("DELETE FROM chat_messages WHERE user_id = ?", (user_id,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ===== 学习评估操作 =====
+
+def save_evaluation(user_id: int, eval_data: dict) -> dict:
+    """保存一次学习评估结果"""
+    conn = get_db()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO evaluations (user_id, eval_json) VALUES (?, ?)",
+            (user_id, json.dumps(eval_data, ensure_ascii=False)),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM evaluations WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return dict(row) if row else {"id": cursor.lastrowid}
+    finally:
+        conn.close()
+
+
+def get_latest_evaluation(user_id: int) -> dict | None:
+    """获取最新一次学习评估"""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM evaluations WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)
+        ).fetchone()
+        if row:
+            result = dict(row)
+            result["eval_data"] = json.loads(result["eval_json"])
+            return result
+        return None
+    finally:
+        conn.close()
+
+
+def get_evaluation_history(user_id: int, limit: int = 10) -> list[dict]:
+    """获取学习评估历史"""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM evaluations WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit)
+        ).fetchall()
+        results = []
+        for r in rows:
+            item = dict(r)
+            item["eval_data"] = json.loads(item["eval_json"])
+            results.append(item)
+        return results
     finally:
         conn.close()

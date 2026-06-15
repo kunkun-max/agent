@@ -45,6 +45,17 @@
               <div v-if="node.resources?.length" class="node-resources">
                 <span v-for="r in node.resources" :key="r" class="resource-chip">{{ resLabel(r) }}</span>
               </div>
+              <div v-if="node.resources?.some(r => SUPPORTED_TYPES.has(r))" class="node-actions" @click.stop>
+                <button
+                  v-for="r in node.resources.filter(r => SUPPORTED_TYPES.has(r))"
+                  :key="'gen-'+r"
+                  :class="['gen-btn', { success: genSuccessKeys.has(nodeKey(p.course, idx, r)) }]"
+                  :disabled="generatingKey === nodeKey(p.course, idx, r) || genSuccessKeys.has(nodeKey(p.course, idx, r))"
+                  @click.stop="generateNodeResources(p, node, r)"
+                >
+                  {{ generatingKey === nodeKey(p.course, idx, r) ? '生成中...' : genSuccessKeys.has(nodeKey(p.course, idx, r)) ? '已生成' : genBtnLabel(r) }}
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -65,9 +76,14 @@
 
 <script setup>
 import { ref, onMounted } from 'vue';
-import { apiRequest } from '../services/api';
+import { apiRequest, getToken, clearToken, clearUser } from '../services/api';
 
 const paths = ref([]);
+const generatingKey = ref('');
+const genSuccessKeys = ref(new Set());
+
+// 后端 Agent 支持的资源类型（与 AGENT_TYPE_MAP 对齐）
+const SUPPORTED_TYPES = new Set(['doc', 'mindmap', 'quiz', 'code', 'reading']);
 
 onMounted(async () => {
   try {
@@ -78,13 +94,13 @@ onMounted(async () => {
         const nodes = (p.path?.nodes || []).map((n, i) => ({
           ...n, _completed: savedCompleted.includes(i)
         }));
-        return { course: p.course, nodes };
+        return { course: p.course, student_summary: p.path?.student_summary || '', nodes };
       });
     }
   } catch (e) { console.log('路径加载失败'); }
 });
 
-function toggleNode(p, idx) {
+async function toggleNode(p, idx) {
   if (idx > 0 && !p.nodes[idx - 1]?._completed) return;
   p.nodes[idx]._completed = !p.nodes[idx]._completed;
   // 取消完成 → 重置后续
@@ -93,10 +109,12 @@ function toggleNode(p, idx) {
   }
   // 保存到后端
   const completed = p.nodes.map((n, i) => n._completed ? i : -1).filter(i => i >= 0);
-  apiRequest('/api/path/progress', {
-    method: 'POST',
-    body: { course: p.course, completed }
-  }).catch(() => {});
+  try {
+    await apiRequest('/api/path/progress', {
+      method: 'POST',
+      body: { course: p.course, completed }
+    });
+  } catch (e) { console.error('[PATH] 进度保存失败:', e.message); }
 }
 
 function getCompleted(p) { return p.nodes.filter(n => n._completed).length; }
@@ -114,6 +132,74 @@ async function deletePath(course) {
     await apiRequest('/api/path?course=' + encodeURIComponent(course), { method: 'DELETE' });
     paths.value = paths.value.filter(p => p.course !== course);
   } catch {}
+}
+
+function nodeKey(course, idx, resType) {
+  return `${course}_${idx}_${resType}`;
+}
+
+function genBtnLabel(r) {
+  const map = { doc: '📝 生成讲义', mindmap: '🧠 生成导图', quiz: '✍️ 生成习题', code: '💻 生成代码', reading: '📖 生成阅读' };
+  return map[r] || `生成 ${r}`;
+}
+
+async function generateNodeResources(pathData, node, resourceType) {
+  const idx = pathData.nodes.indexOf(node);
+  const realKey = nodeKey(pathData.course, idx, resourceType);
+  generatingKey.value = realKey;
+
+  try {
+    const body = {
+      course: pathData.course || '',
+      student_summary: pathData.student_summary || '',
+      topic: node.topic || '',
+      goal: node.goal || '',
+      resource_type: resourceType,
+    };
+
+    const headers = { 'Content-Type': 'application/json' };
+    const token = getToken();
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const resp = await fetch('/api/path/generate-resources', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+      if (resp.status === 401) { clearToken(); clearUser(); window.location.reload(); return; }
+      throw new Error('请求失败');
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.__done__) {
+            const newSet = new Set(genSuccessKeys.value);
+            newSet.add(realKey);
+            genSuccessKeys.value = newSet;
+          }
+        } catch {}
+      }
+    }
+  } catch (e) {
+    console.error('资源生成失败:', e);
+  } finally {
+    generatingKey.value = '';
+  }
 }
 </script>
 
@@ -269,6 +355,27 @@ async function deletePath(course) {
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 600;
+}
+
+/* 资源生成按钮组 */
+.node-actions {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px;
+}
+.gen-btn {
+  padding: 4px 12px; border-radius: 6px; font-size: 11px;
+  background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.15);
+  color: rgba(255,255,255,0.70); cursor: pointer;
+  transition: all 0.15s;
+}
+.gen-btn:hover:not(:disabled) {
+  border-color: var(--accent); color: var(--accent); background: var(--accent-soft);
+}
+.gen-btn:disabled {
+  opacity: 0.5; cursor: not-allowed;
+}
+.gen-btn.success {
+  border-color: #22c55e; color: #22c55e; background: rgba(34,197,94,0.10);
+  opacity: 0.8; cursor: default;
 }
 
 .path-stats {

@@ -3,8 +3,8 @@
     <div class="nav-header">
       <div class="nav-header-row">
         <template v-if="!isCollapsed">
-          <span class="nav-logo">智学</span>
-          <span class="nav-subtitle">Learning Agent</span>
+          <span class="nav-logo">知途</span>
+          <span class="nav-subtitle">个性化学习小助手喵~</span>
         </template>
         <button class="collapse-btn" @click="$emit('toggle')" :title="isCollapsed ? '展开侧栏' : '收起侧栏'">
           <span v-if="isCollapsed">◀</span>
@@ -81,6 +81,7 @@ const navItems = [
   { path: '/resources', label: '学习资源', icon: '📚' },
   { path: '/profile', label: '我的画像', icon: '👤' },
   { path: '/path', label: '学习路径', icon: '🗺️' },
+  { path: '/evaluate', label: '学习评估', icon: '📊' },
 ];
 
 function isActive(path) {

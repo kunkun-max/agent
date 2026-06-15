@@ -38,6 +38,7 @@ from backend.models.database import create_user, authenticate as db_authenticate
 from backend.models.database import get_profile, update_profile as db_update_profile
 from backend.models.database import add_resource, get_resources, get_path, list_paths, update_path as db_update_path, delete_path as db_delete_path
 from backend.models.database import save_chat_message, get_chat_history
+from backend.models.database import save_evaluation, get_latest_evaluation, get_evaluation_history
 
 from backend.utils.llm_client import SparkLLMClient
 from backend.utils.pptx_builder import build_pptx
@@ -374,6 +375,31 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                         print(f"[PROFILE] 画像已更新")
                 except Exception as ex:
                     print(f"[PROFILE] 提取失败: {ex}")
+            # 评估数据自动提取：当意图是 evaluate 时，从回复中提取JSON并持久化
+            if orchestrator_intent == 'evaluate' and user:
+                try:
+                    import re
+                    eval_data = None
+                    # 方式1: 匹配 ```json...``` 代码块
+                    json_match = re.search(r'```json\s*([\s\S]*?)```', full_reply)
+                    if json_match:
+                        eval_data = json.loads(json_match.group(1).strip())
+                    # 方式2: 匹配 {...} JSON 对象（含 overall_score 字段）
+                    if not eval_data:
+                        for m in re.finditer(r'\{[\s\S]*?"overall_score"[\s\S]*?\}', full_reply):
+                            try:
+                                eval_data = json.loads(m.group())
+                                break
+                            except json.JSONDecodeError:
+                                continue
+                    # 方式3: 用 agent 的 _parse_json 兜底
+                    if not eval_data:
+                        eval_data = eval_agent._parse_json(full_reply)
+                    if eval_data and "overall_score" in eval_data:
+                        save_evaluation(user_id, eval_data)
+                        print(f"[EVAL] 评估已保存，总分={eval_data.get('overall_score')}")
+                except Exception as ex:
+                    print(f"[EVAL] 评估提取失败: {ex}")
             yield "data: [DONE]\n\n"
         except Exception as e:
             error_data = json.dumps({"error": str(e)}, ensure_ascii=False)
@@ -421,11 +447,12 @@ class SaveMessageRequest(BaseModel):
     text: str
 
 @app.get("/api/chat/history")
-async def api_get_chat_history(user: dict = Depends(get_current_user)):
-    """获取聊天历史"""
+async def api_get_chat_history(limit: int = 30, offset: int = 0, user: dict = Depends(get_current_user)):
+    """获取聊天历史（分页：offset=0为最新N条，offset=30为倒数第31-60条）"""
     if not user:
-        return {"messages": []}
-    return {"messages": get_chat_history(user["id"])}
+        return {"messages": [], "total": 0}
+    messages, total = get_chat_history(user["id"], limit=limit, offset=offset)
+    return {"messages": messages, "total": total}
 
 @app.post("/api/chat/history")
 async def api_save_chat_message(req: SaveMessageRequest, user: dict = Depends(get_current_user)):
@@ -550,6 +577,135 @@ async def api_ppt_download(filename: str):
 async def kb_upload(filepath: str, topic: str = ""):
     doc_ids = knowledge_base.add_markdown_file(filepath, topic)
     return {"loaded": len(doc_ids), "doc_ids": doc_ids, "stats": knowledge_base.get_stats()}
+
+
+# ========== 学习评估 API ==========
+
+@app.get("/api/evaluate")
+async def api_get_evaluate(user: dict = Depends(get_current_user)):
+    """获取最新一次学习评估"""
+    if not user:
+        raise HTTPException(401, "请先登录")
+    evaluation = get_latest_evaluation(user["id"])
+    return {"evaluation": evaluation}
+
+
+@app.get("/api/evaluate/history")
+async def api_get_evaluate_history(user: dict = Depends(get_current_user)):
+    """获取学习评估历史"""
+    if not user:
+        raise HTTPException(401, "请先登录")
+    evaluations = get_evaluation_history(user["id"])
+    return {"evaluations": evaluations}
+
+
+@app.post("/api/evaluate/trigger")
+async def api_trigger_evaluate(user: dict = Depends(get_current_user)):
+    """手动触发学习评估 — 基于画像和聊天记录生成评估报告"""
+    if not user:
+        raise HTTPException(401, "请先登录")
+
+    user_id = user["id"]
+    profile = get_profile(user_id)
+    chat_history, _ = get_chat_history(user_id, limit=30)
+    resources = get_resources(user_id)
+
+    # 组装评估上下文
+    context_parts = []
+    if profile:
+        context_parts.append(f"学生画像：{json.dumps(profile, ensure_ascii=False)}")
+    if resources:
+        res_summary = [f"- {r['resource_type']}:{r['topic']}" for r in resources[:10]]
+        context_parts.append("已生成的学习资源：\n" + "\n".join(res_summary))
+    if chat_history:
+        recent_chat = [f"[{m['role']}] {m['text'][:200]}" for m in chat_history[-10:]]
+        context_parts.append("最近对话：\n" + "\n".join(recent_chat))
+
+    context = "\n\n".join(context_parts) if context_parts else "暂无学习数据"
+    eval_prompt = f"请根据以下学生的学习数据，生成一份学习效果评估报告。\n\n{context}"
+
+    try:
+        # 调用 EvalAgent 生成评估
+        result = await eval_agent.chat(eval_prompt)
+        # 提取JSON
+        eval_data = eval_agent._parse_json(result)
+        if "error" in eval_data and "overall_score" not in eval_data:
+            # 回退：尝试直接从文本中提取
+            import re
+            json_match = re.search(r'```json\s*([\s\S]*?)```', result)
+            if json_match:
+                eval_data = json.loads(json_match.group(1).strip())
+        # 持久化
+        if "overall_score" in eval_data:
+            save_evaluation(user_id, eval_data)
+        return {"evaluation": eval_data}
+    except Exception as e:
+        return {"error": f"评估生成失败：{str(e)}"}
+
+
+# ========== 路径资源推送 API ==========
+
+AGENT_TYPE_MAP = {
+    "doc": ("DocAgent", "课程讲义"),
+    "mindmap": ("MindmapAgent", "思维导图"),
+    "quiz": ("QuizAgent", "练习题"),
+    "code": ("CodeAgent", "代码案例"),
+    "reading": ("ReadingAgent", "拓展阅读"),
+}
+
+
+@app.post("/api/path/generate-resources")
+async def api_path_generate_resources(req: dict, user: dict = Depends(get_current_user)):
+    """基于路径节点上下文流式生成学习资源"""
+    if not user:
+        raise HTTPException(401, "请先登录")
+
+    course = req.get("course", "")
+    student_summary = req.get("student_summary", "")
+    topic = req.get("topic", "")
+    goal = req.get("goal", "")
+    resource_type = req.get("resource_type", "doc")
+
+    agent_info = AGENT_TYPE_MAP.get(resource_type)
+    if not agent_info:
+        raise HTTPException(400, f"不支持的资源类型: {resource_type}")
+
+    agent_name, type_label = agent_info
+    agent_obj = orchestrator.sub_agents.get(agent_name)
+    if not agent_obj:
+        raise HTTPException(500, f"Agent {agent_name} 未注册")
+
+    user_id = user["id"]
+
+    prompt = (
+        f"课程：{course}\n"
+        f"学生情况：{student_summary}\n"
+        f"当前知识点：{topic}\n"
+        f"学习目标：{goal}\n\n"
+        f"请为该知识点生成一份{type_label}。"
+    )
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        full_reply = ""
+        try:
+            async for chunk in agent_obj.chat_stream(prompt):
+                full_reply += chunk
+                data = json.dumps({"content": chunk}, ensure_ascii=False)
+                yield f"data: {data}\n\n"
+                await asyncio.sleep(0)
+            # 持久化到资源表
+            title = f"{topic} - {type_label}"
+            add_resource(user_id, resource_type, topic, title, full_reply, agent_name)
+            yield f"data: {json.dumps({'__done__': True, 'saved': True})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 if __name__ == "__main__":
