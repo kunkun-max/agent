@@ -10,6 +10,8 @@
     </header>
 
     <div class="msg-list" ref="msgListRef">
+      <div v-if="historyLoading" class="history-loading">加载更多消息中...</div>
+      <div v-else-if="historyFullyLoaded && messages.length > 1" class="history-loaded">已加载全部消息</div>
       <div v-if="messages.length <= 1" class="empty-chat">
         发送消息，开始你的个性化学习之旅～
       </div>
@@ -68,24 +70,65 @@ const DEFAULT_WELCOME = { id: 'welcome', text: '你好！我是你的专属学�
 
 const messages = ref([DEFAULT_WELCOME]);
 
-// 从后端加载历史
+// ===== 分页加载聊天记录 =====
+const historyTotal = ref(0);
+const historyOffset = ref(0);
+const historyLoading = ref(false);
+const historyFullyLoaded = ref(false);
+const PAGE_SIZE = 30;
+
 async function loadHistory() {
   if (!isLoggedIn()) return;
   try {
-    const data = await apiRequest('/api/chat/history');
+    const data = await apiRequest(`/api/chat/history?limit=${PAGE_SIZE}&offset=0`);
     if (data.messages && data.messages.length > 0) {
       messages.value = data.messages.map(m => ({
         id: m.id, text: m.text, isUser: m.role === 'user',
       }));
+      historyTotal.value = data.total || 0;
+      historyOffset.value = data.messages.length;
+      if (historyOffset.value >= historyTotal.value) historyFullyLoaded.value = true;
     }
   } catch {}
 }
 
-// 保存单条消息到后端
-function saveToServer(role, text) {
+async function loadMoreHistory() {
+  if (historyLoading.value || historyFullyLoaded.value || !isLoggedIn()) return;
+  historyLoading.value = true;
+  try {
+    const el = msgListRef.value;
+    const prevHeight = el ? el.scrollHeight : 0;
+    const data = await apiRequest(`/api/chat/history?limit=${PAGE_SIZE}&offset=${historyOffset.value}`);
+    if (data.messages && data.messages.length > 0) {
+      const older = data.messages.map(m => ({
+        id: m.id, text: m.text, isUser: m.role === 'user',
+      }));
+      messages.value = [...older, ...messages.value];
+      historyOffset.value += data.messages.length;
+      // 保持滚动位置不跳动
+      nextTick(() => {
+        if (el) el.scrollTop = el.scrollHeight - prevHeight;
+      });
+      if (historyOffset.value >= (data.total || 0)) historyFullyLoaded.value = true;
+    } else {
+      historyFullyLoaded.value = true;
+    }
+  } catch {}
+  historyLoading.value = false;
+}
+
+// 保存单条消息到后端（带重试）
+async function saveToServer(role, text, retries = 2) {
   if (!isLoggedIn() || !text) return;
-  apiRequest('/api/chat/history', { method: 'POST', body: { role, text } })
-    .catch(e => console.error('[HISTORY] 保存失败:', role, e.message));
+  for (let i = 0; i <= retries; i++) {
+    try {
+      await apiRequest('/api/chat/history', { method: 'POST', body: { role, text } });
+      return; // 成功
+    } catch (e) {
+      console.error(`[HISTORY] 保存失败 (${role}, 第${i+1}次):`, e.message);
+      if (i < retries) await new Promise(r => setTimeout(r, 500));
+    }
+  }
 }
 
 const input = ref('');
@@ -108,6 +151,41 @@ function getMermaid() {
 }
 const mermaidCache = ref({});
 window.__mermaidCache = mermaidCache.value;
+
+// 流结束后自动渲染所有未渲染的 mermaid 块
+function autoRenderMermaid() {
+  const blocks = document.querySelectorAll('.mermaid-block:not(.rendered):not(.rendering)');
+  if (!blocks.length) return;
+  const mm = getMermaid();
+  if (!mm) return;
+  mm.then(function(mermaid) {
+    blocks.forEach(function(block) {
+      if (block.classList.contains('rendered') || block.classList.contains('rendering')) return;
+      const btn = block.querySelector('.mermaid-render-btn');
+      if (!btn) return;
+      const rawCode = btn.dataset.mermaidCode;
+      if (!rawCode) return;
+      block.classList.add('rendering');
+      const blockId = block.id;
+      mermaid.render(blockId + '_svg', rawCode).then(function(r) {
+        if (r.svg.indexOf('Syntax error') >= 0) { block.classList.remove('rendering'); return; }
+        block.innerHTML = r.svg;
+        block.classList.add('rendered');
+        block.classList.remove('rendering');
+        block.style.cursor = 'zoom-in';
+        if (window.__mermaidCache) window.__mermaidCache[rawCode.trim()] = r.svg;
+        block.onclick = function() {
+          var o = document.getElementById('_zoom_overlay');
+          if (!o) { o = document.createElement('div'); o.id = '_zoom_overlay'; o.style = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.88);display:flex;align-items:center;justify-content:center;cursor:zoom-out'; o.onclick = function() { o.remove(); }; document.body.appendChild(o); }
+          o.innerHTML = '';
+          var b = document.createElement('div'); b.style = 'padding:32px;background:#151515;border-radius:12px;max-width:95vw;max-height:90vh;overflow:auto';
+          b.innerHTML = this.outerHTML; b.querySelector('svg').style = 'min-width:70vw;min-height:60vh;max-width:100%;height:auto';
+          o.appendChild(b);
+        };
+      }).catch(function() { block.classList.remove('rendering'); });
+    });
+  });
+}
 
 const quickActions = [
   { label: '📝 生成讲义', intent: 'generate_doc', msg: '[INTENT:generate_doc]帮我生成一份关于[知识点]的课程讲义' },
@@ -142,15 +220,15 @@ function startTyping(msgObj) {
     const latest = Array.from(currentTypingMsgObj._raw || '');
     currentFullText = latest.join('');
     if (currentCharIdx < latest.length) {
-      // 每次输出2-4个字符，加速显示
-      const step = Math.min(3, latest.length - currentCharIdx);
+      // 每次输出4-6个字符，加速显示
+      const step = Math.min(5, latest.length - currentCharIdx);
       currentTypingMsgObj.text = latest.slice(0, currentCharIdx + step).join('');
       currentCharIdx += step;
     }
     if (!streaming.value && currentCharIdx >= latest.length) {
       finishTyping();
     }
-  }, 15);
+  }, 10);
 }
 
 function stopTyping(complete) {
@@ -212,7 +290,7 @@ async function send() {
   // 用户消息（显示时去掉意图标签）
   const displayMsg = msg.replace(/^\[INTENT:\w+\]\s*/, '');
   messages.value.push({ id: 'u' + Date.now(), text: displayMsg, isUser: true });
-  saveToServer('user', msg);
+  await saveToServer('user', msg);
 
   // 优先从前端快捷按钮提取意图标签
   let detectedIntent = 'chat';
@@ -289,28 +367,42 @@ async function send() {
     msgObj._raw = `出错了：${err.message}`;
   } finally {
     streaming.value = false;
+    // 流结束后自动渲染所有未渲染的 mermaid 块（流式分块可能导致正则匹配不到）
+    nextTick(() => { autoRenderMermaid(); });
     // AI回复存到后端（去除画像标记）
     const cleanText = (msgObj._raw || '').replace(/---PROFILE---[\s\S]*?---END---/g, '').replace(/___INTENT_META___\{[^}]*\}/g, '').trim();
-    if (cleanText) saveToServer('assistant', cleanText);
-    // 用后端LLM识别的意图决定是否存资源
-    console.log('[SAVE]', detectedIntent, detectedTopic, msgObj._raw?.length);
-	    if (['generate_doc','generate_mindmap','generate_quiz','generate_code','generate_reading','generate_ppt','generate_all'].includes(detectedIntent)) {
-      // generate_all：存为全套资料
+    console.log('[SAVE-DEBUG] raw_len=%d clean_len=%d intent=%s', msgObj._raw?.length, cleanText.length, detectedIntent);
+    if (cleanText) {
+      await saveToServer('assistant', cleanText);
+      console.log('[SAVE-DEBUG] assistant 保存完成');
+    } else {
+      console.warn('[SAVE-DEBUG] cleanText 为空，跳过保存！');
+    }
+    // 保存学习资源：Orchestrator判断意图 → 对应Agent生成 → 按类型保存
+    if (['generate_doc','generate_mindmap','generate_quiz','generate_code','generate_reading','generate_ppt','generate_all'].includes(detectedIntent)) {
       if (detectedIntent === 'generate_all') {
+        // 全套资源：保存完整原始内容（含所有Agent的输出段）
         if (msgObj._raw && msgObj._raw.length > 120) {
-          apiRequest('/api/resources/save', { method: 'POST', body: {
-            resource_type: 'doc', topic: detectedTopic, title: (detectedTopic || '学习资料') + ' - 全套资源',
-            content: msgObj._raw, agent: '多Agent协同',
-          }}).catch(() => {});
+          try {
+            await apiRequest('/api/resources/save', { method: 'POST', body: {
+              resource_type: 'full', topic: detectedTopic, title: (detectedTopic || '学习资料') + ' - 全套资源',
+              content: msgObj._raw, agent: '多Agent协同',
+            }});
+            console.log('[RESOURCE] 全套资源已保存');
+          } catch (e) { console.error('[RESOURCE] 全套资源保存失败:', e.message); }
         }
       } else {
-        const type = { generate_doc:'doc', generate_mindmap:'mindmap', generate_quiz:'quiz', generate_code:'code', generate_reading:'reading' }[detectedIntent];
-        if (type && msgObj._raw && msgObj._raw.length > 120) {
-          const agent = { generate_doc:'DocAgent', generate_mindmap:'MindmapAgent', generate_quiz:'QuizAgent', generate_code:'CodeAgent', generate_reading:'ReadingAgent' }[detectedIntent] || 'AI助手';
-          apiRequest('/api/resources/save', { method: 'POST', body: {
-            resource_type: type, topic: detectedTopic, agent,
-            title: detectedTopic + ' - ' + typeLabel(type), content: msgObj._raw,
-          }}).catch(() => {});
+        // 单类型资源：按意图对应的类型保存
+        const type = { generate_doc:'doc', generate_mindmap:'mindmap', generate_quiz:'quiz', generate_code:'code', generate_reading:'reading', generate_ppt:'ppt' }[detectedIntent];
+        if (type && cleanText && cleanText.length > 120) {
+          const agent = { generate_doc:'DocAgent', generate_mindmap:'MindmapAgent', generate_quiz:'QuizAgent', generate_code:'CodeAgent', generate_reading:'ReadingAgent', generate_ppt:'PPTAgent' }[detectedIntent] || 'AI助手';
+          try {
+            await apiRequest('/api/resources/save', { method: 'POST', body: {
+              resource_type: type, topic: detectedTopic, agent,
+              title: detectedTopic + ' - ' + typeLabel(type), content: cleanText,
+            }});
+            console.log('[RESOURCE] %s 已保存 (intent=%s)', type, detectedIntent);
+          } catch (e) { console.error('[RESOURCE] %s 保存失败:', type, e.message); }
         }
       }
     }
@@ -327,8 +419,10 @@ async function send() {
         }
         const pathData = JSON.parse(jsonStr.trim());
         if (pathData.nodes && Array.isArray(pathData.nodes)) {
-          apiRequest('/api/path/save', { method: 'POST', body: pathData }).catch(() => {});
-          console.log('[PATH] 学习路径已保存，节点数:', pathData.nodes.length);
+          try {
+            await apiRequest('/api/path/save', { method: 'POST', body: pathData });
+            console.log('[PATH] 学习路径已保存，节点数:', pathData.nodes.length);
+          } catch (e) { console.error('[PATH] 保存失败:', e.message); }
         }
       } catch (e) { console.log('[PATH] 解析失败:', e.message); }
     }
@@ -336,7 +430,7 @@ async function send() {
 }
 
 function typeLabel(type) {
-  return { doc: '课程讲义', mindmap: '思维导图', quiz: '练习题目', reading: '拓展阅读', code: '代码案例' }[type] || type;
+  return { doc: '课程讲义', mindmap: '思维导图', quiz: '练习题目', reading: '拓展阅读', code: '代码案例', ppt: 'PPT课件' }[type] || type;
 }
 
 // 自定义壁纸（仅当前会话生效，刷新恢复默认）
@@ -372,15 +466,26 @@ function renderMarkdown(text) {
   try {
     // 先渲染 LaTeX，避免被 marked 转义
     let html = text;
+    // 【关键】先提取 mermaid 代码块，防止 LaTeX $...$ 误匹配
+    const mermaidPlaceholders = [];
+    html = html.replace(/```mermaid\s*\n([\s\S]*?)```/g, (_, code) => {
+      const key = '__MERMAID_' + mermaidPlaceholders.length + '__';
+      mermaidPlaceholders.push(code);
+      return key;
+    });
     // 块级公式 $$...$$
     html = html.replace(/\$\$([\s\S]*?)\$\$/g, (_, formula) => {
-      try { return katex.renderToString(formula.trim(), { displayMode: true, throwOnError: false }); }
+      try { return katex.renderToString(formula.trim(), { displayMode: true, throwOnError: false, strict: false }); }
       catch { return `<code>${formula}</code>`; }
     });
-    // 行内公式 $...$
-    html = html.replace(/\$(.+?)\$/g, (_, formula) => {
-      try { return katex.renderToString(formula.trim(), { displayMode: false, throwOnError: false }); }
+    // 行内公式 $...$（严格匹配：排除中文和金额符号，要求含字母或运算符）
+    html = html.replace(/\$([^\s$][^$\n]*?[a-zA-Z\\\/\+\-\=\(\)\[\]\{\}][^$\n]*?)\$/g, (_, formula) => {
+      try { return katex.renderToString(formula.trim(), { displayMode: false, throwOnError: false, strict: false }); }
       catch { return `<code>${formula}</code>`; }
+    });
+    // 还原 mermaid 占位符
+    mermaidPlaceholders.forEach((code, i) => {
+      html = html.replace('__MERMAID_' + i + '__', '```mermaid\n' + code + '```');
     });
     // 先在marked.parse前提取路径JSON（避免引号被转义导致解析失败）
     let pathNodes = null;
@@ -537,6 +642,10 @@ onMounted(async () => {
     if (el) {
       el.addEventListener('scroll', () => {
         showScrollBtn.value = (el.scrollHeight - el.scrollTop - el.clientHeight) > 200;
+        // 滚动到顶部附近 → 加载更多历史
+        if (el.scrollTop < 80 && !historyLoading.value && !historyFullyLoaded.value) {
+          loadMoreHistory();
+        }
       }, { passive: true });
       // 委托：Mermaid 渲染按钮
       el.addEventListener('click', (e) => {
@@ -595,6 +704,9 @@ onBeforeUnmount(() => { stopTyping(true); });
 .wallpaper-btn:hover { border-color: var(--accent); color: rgba(255,255,255,0.92); }
 
 .empty-chat { text-align: center; color: rgba(255,255,255,0.50); padding: 60px 20px; font-size: 14px; }
+.history-loading, .history-loaded {
+  text-align: center; padding: 10px; font-size: 12px; color: rgba(255,255,255,0.40);
+}
 
 .msg-list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 16px 24px; display: flex; flex-direction: column; gap: 10px; }
 .msg-list::-webkit-scrollbar { width: 6px; }

@@ -206,7 +206,7 @@ class Orchestrator(BaseAgent):
                 ("QuizAgent", "✍️ 出练习题"),
                 ("CodeAgent", "💻 代码实操案例"),
                 ("ReadingAgent", "📖 拓展阅读推荐"),
-                ("PPTAgent", "📊 生成PPT课件"),
+                # ("PPTAgent", "📊 生成PPT课件"),
             ]
             for agent_name, prefix in multi_agents:
                 ag = self.sub_agents.get(agent_name)
@@ -246,49 +246,63 @@ class Orchestrator(BaseAgent):
         # PPTAgent 特殊处理：不流式输出JSON，只显示生成状态 + 下载链接
         if intent == "generate_ppt":
             yield "📊 正在为你生成PPT课件...\n\n"
-            full = ""
-            context_msg = f"请为知识点「{topic}」生成一份PPT课件。必须包含2-3页可运行的代码示例（code字段），每条bullet写60-100字含具体语法/函数名。学生画像：{json.dumps(student_profile or {}, ensure_ascii=False)}\n\n{context_msg}"
-            async for chunk in agent.chat_stream(context_msg):
-                full += chunk
+            prompt = f"为「{topic}」生成PPT课件JSON，8-12页，含2-3页代码示例。输出纯JSON格式：{{\"title\":\"...\",\"subtitle\":\"...\",\"slides\":[{{\"title\":\"...\",\"bullets\":[\"...\"]}}]}}"
+            full = await agent.chat(prompt)
             try:
                 import re
                 from backend.utils.pptx_builder import build_pptx
-                json_match = re.search(r'```json\s*([\s\S]*?)```', full)
-                json_str = (json_match.group(1) if json_match else full).strip()
-                # 修复常见 JSON 语法问题
+                # 检查API错误
+                if full.startswith('[API'):
+                    raise Exception(full[:100])
+                # 多重提取JSON
+                json_str = None
+                m = re.search(r'```json\s*([\s\S]*?)```', full)
+                if m:
+                    json_str = m.group(1).strip()
+                if not json_str:
+                    start = full.find('{')
+                    end = full.rfind('}')
+                    if start != -1 and end > start:
+                        json_str = full[start:end+1].strip()
+                if not json_str or not json_str.startswith('{'):
+                    raise Exception("未找到PPT JSON数据")
+                # 修复尾部逗号
                 json_str = re.sub(r',\s*}', '}', json_str)
                 json_str = re.sub(r',\s*]', ']', json_str)
-                json_str = re.sub(r'\n\s*}', '\n}', json_str)
-                # 多层尝试解析
-                ppt_data = None
-                for attempt in range(4):
-                    try:
-                        ppt_data = json.loads(json_str)
-                        break
-                    except json.JSONDecodeError:
-                        if attempt == 0:
-                            def _esc(m):
-                                return m.group().replace('\n', '\\n').replace('\t', '\\t').replace('\r', '')
-                            json_str = re.sub(r'"[^"]*"', _esc, json_str)
-                        elif attempt == 1:
-                            # 替换 JSON 特有语法为 Python 语法
-                            json_str = re.sub(r':\s*true\b', ': True', json_str)
-                            json_str = re.sub(r':\s*false\b', ': False', json_str)
-                            json_str = re.sub(r':\s*null\b', ': None', json_str)
-                        elif attempt == 2:
-                            import ast
-                            ppt_data = ast.literal_eval(json_str)
+                # 解析JSON（多层修复）
+                def _parse_ppt_json(s):
+                    try: return json.loads(s)
+                    except: pass
+                    try: return json.loads(s.replace("'", '"'))
+                    except: pass
+                    import ast
+                    try: return ast.literal_eval(s)
+                    except: pass
+                    fixed = re.sub(r"(?<=[{,])\s*'([^']*)'\s*:", r' "\1":', s)
+                    fixed = re.sub(r":\s*'([^']*)'", r': "\1"', fixed)
+                    try: return json.loads(fixed)
+                    except: pass
+                    cleaned = re.sub(r"'([^']*)'", r'"\1"', s)
+                    cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+                    return json.loads(cleaned)
+
+                ppt_data = _parse_ppt_json(json_str)
+                # 递归查找slides字段
+                if not ppt_data.get("slides") and isinstance(ppt_data, dict):
+                    for v in ppt_data.values():
+                        if isinstance(v, dict) and v.get("slides"):
+                            ppt_data = v
                             break
-                if ppt_data is None:
-                    raise Exception("JSON解析失败，请重试")
-                if ppt_data.get("slides"):
-                    filepath = build_pptx(ppt_data)
-                    filename = os.path.basename(filepath)
-                    slide_count = len(ppt_data["slides"])
-                    yield f"✅ PPT课件已生成！共 **{slide_count}** 页\n\n"
-                    yield f"📥 **[下载PPT课件：{ppt_data.get('title', '课件')}](/api/ppt/download/{filename})**\n"
-                else:
-                    yield "⚠️ PPT内容生成失败，请稍后重试\n"
+                        if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict) and v[0].get("title"):
+                            ppt_data = {"slides": v}
+                            break
+                if not ppt_data.get("slides"):
+                    raise Exception(f"JSON缺少slides字段，keys={list(ppt_data.keys())}")
+                filepath = build_pptx(ppt_data)
+                filename = os.path.basename(filepath)
+                slide_count = len(ppt_data["slides"])
+                yield f"✅ PPT课件已生成！共 **{slide_count}** 页\n\n"
+                yield f"📥 **[下载PPT课件：{ppt_data.get('title', '课件')}](/api/ppt/download/{filename})**\n"
             except Exception as e:
                 yield f"⚠️ PPT课件生成失败：{str(e)[:100]}\n"
             return

@@ -4,6 +4,7 @@ import LearnView from '../views/LearnView.vue';
 import ResourcesView from '../views/ResourcesView.vue';
 import ProfileView from '../views/ProfileView.vue';
 import PathView from '../views/PathView.vue';
+import EvaluateView from '../views/EvaluateView.vue';
 import LoginView from '../views/LoginView.vue';
 
 const routes = [
@@ -13,6 +14,7 @@ const routes = [
   { path: '/resources', component: ResourcesView, meta: { requiresAuth: true } },
   { path: '/profile', component: ProfileView, meta: { requiresAuth: true } },
   { path: '/path', component: PathView, meta: { requiresAuth: true } },
+  { path: '/evaluate', component: EvaluateView, meta: { requiresAuth: true } },
 ];
 
 const router = createRouter({

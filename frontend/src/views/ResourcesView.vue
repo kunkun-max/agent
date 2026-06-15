@@ -56,6 +56,17 @@ const resources = ref([]);
 const selectedIdx = ref(-1);
 const showDetail = ref(false);
 
+// 页面加载时预加载 mermaid 库
+if (!window._resMermaidReady) {
+  window._resMermaidReady = import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs').then((m) => {
+    m.default.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'loose', suppressErrorRendering: true });
+    return m.default;
+  });
+}
+
+// 存储 mermaid 原始代码（key = 元素ID）
+const mermaidCodeMap = {};
+
 onMounted(async () => {
   try {
     const data = await apiRequest('/api/resources');
@@ -82,6 +93,7 @@ const typeLabel = (type) => {
     reading: { label: '拓展阅读', icon: '📖' },
     code: { label: '代码案例', icon: '💻' },
     ppt: { label: 'PPT课件', icon: '📊' },
+    full: { label: '全套资源', icon: '🎓' },
   };
   return map[type] || { label: type, icon: '📄' };
 };
@@ -95,17 +107,28 @@ function renderMarkdown(text) {
   if (!text) return '';
   try {
     let html = text;
+
+    // 【关键】先提取 mermaid 代码块，防止 LaTeX $...$ 误匹配
+    const mermaidBlocks = [];
+    html = html.replace(/```mermaid\s*\n([\s\S]*?)```/g, (_, code) => {
+      const id = 'res_mm_' + Math.random().toString(36).slice(2, 8);
+      mermaidBlocks.push({ id, code: code.trim() });
+      return `<!--MERMAID_${id}-->`;
+    });
+
     // 块级公式
     html = html.replace(/\$\$([\s\S]*?)\$\$/g, (_, f) => {
-      try { return katex.renderToString(f.trim(), { displayMode: true, throwOnError: false }); }
+      try { return katex.renderToString(f.trim(), { displayMode: true, throwOnError: false, strict: false }); }
       catch { return `<code>${f}</code>`; }
     });
     // 行内公式
-    html = html.replace(/\$(.+?)\$/g, (_, f) => {
-      try { return katex.renderToString(f.trim(), { displayMode: false, throwOnError: false }); }
+    html = html.replace(/\$([^\s$][^$\n]*?[a-zA-Z\\\/\+\-\=\(\)\[\]\{\}][^$\n]*?)\$/g, (_, f) => {
+      try { return katex.renderToString(f.trim(), { displayMode: false, throwOnError: false, strict: false }); }
       catch { return `<code>${f}</code>`; }
     });
+
     html = marked.parse(html);
+
     // 路径JSON → 渲染流程图
     html = html.replace(/<pre><code class="language-json">([\s\S]*?)<\/code><\/pre>/g, (_, code) => {
       try {
@@ -125,31 +148,16 @@ function renderMarkdown(text) {
       } catch {}
       return '';
     });
-    // Mermaid → 思维导图
-    html = html.replace(/<pre><code class="language-mermaid">([\s\S]*?)<\/code><\/pre>/g, (_, code) => {
-      const id = 'res_mermaid_' + Math.random().toString(36).slice(2, 8);
-      nextTick(() => {
-        if (!window._resMermaidReady) {
-          window._resMermaidReady = import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs').then((m) => {
-            m.default.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'loose', suppressErrorRendering: true });
-            return m.default;
-          });
-        }
-        window._resMermaidReady.then((mermaid) => {
-          const el = document.getElementById(id);
-          if (!el) return;
-          mermaid.render(id + '_svg', code).then(({ svg }) => {
-            if (svg.includes('Syntax error')) return;
-            el.innerHTML = svg;
-            el.classList.add('rendered');
-          }).catch(() => { el.classList.add('rendered'); });
-        }).catch(() => {});
-      });
-      return `<div class="mermaid-block" id="${id}">
-        <div class="mermaid-loading">⟳ 图表生成中...</div>
-        <pre><code>${code}</code></pre>
-      </div>`;
-    });
+
+    // 把提取的 mermaid 块还原为占位 div，代码存入 JS Map
+    for (const { id, code } of mermaidBlocks) {
+      mermaidCodeMap[id] = code;
+      html = html.replace(
+        `<!--MERMAID_${id}-->`,
+        `<div class="mermaid-block" id="${id}"><div class="mermaid-loading">图表生成中...</div></div>`
+      );
+    }
+
     return html;
   } catch { return text; }
 }
@@ -157,6 +165,39 @@ function renderMarkdown(text) {
 watch(selectedIdx, (v) => {
   if (v >= 0) showDetail.value = true;
 });
+
+// 详情面板打开后，持续轮询渲染 mermaid 块，直到全部完成
+watch(showDetail, (visible) => {
+  if (!visible) return;
+  let attempts = 0;
+  const poll = () => {
+    attempts++;
+    const rendered = renderAllMermaid();
+    if (!rendered && attempts < 30) setTimeout(poll, 100);  // 最多等3秒
+  };
+  setTimeout(poll, 50);
+});
+
+// 渲染所有 mermaid 块，返回 true 表示全部完成或无需渲染
+function renderAllMermaid() {
+  const blocks = document.querySelectorAll('.mermaid-block:not(.rendered):not(.rendering)');
+  if (!blocks.length) return true;
+  window._resMermaidReady?.then((mermaid) => {
+    blocks.forEach((el) => {
+      if (el.classList.contains('rendered') || el.classList.contains('rendering')) return;
+      const code = mermaidCodeMap[el.id];
+      if (!code) return;
+      el.classList.add('rendering');
+      mermaid.render(el.id + '_svg', code).then(({ svg }) => {
+        if (svg.includes('Syntax error')) { el.classList.remove('rendering'); return; }
+        el.innerHTML = svg;
+        el.classList.add('rendered');
+        el.classList.remove('rendering');
+      }).catch(() => { el.classList.remove('rendering'); });
+    });
+  });
+  return false;
+}
 
 function openCard(idx) {
   // 点同一张卡 → 强制关闭再打开，解决 watch 不触发的问题
@@ -241,6 +282,7 @@ function openCard(idx) {
 .card-badge.reading { background: #dcfce7; color: #15803d; }
 .card-badge.code { background: #cffafe; color: #0e7490; }
 .card-badge.ppt { background: #f3e8ff; color: #7c3aed; }
+.card-badge.full { background: #fef3c7; color: #d97706; }
 
 .card-title { font-size: 15px; font-weight: 600; margin: 0 0 4px; color: var(--ink); }
 .card-agent { font-size: 11px; color: var(--ink-dim); margin: 0 0 8px; }

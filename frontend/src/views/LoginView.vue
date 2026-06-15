@@ -2,7 +2,7 @@
   <div class="login-page">
     <div class="login-card">
       <div class="login-header">
-        <h1>智学</h1>
+        <h1>知途</h1>
         <p>个性化学习多智能体系统</p>
       </div>
 
