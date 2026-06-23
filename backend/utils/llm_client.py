@@ -15,10 +15,10 @@ import httpx
 
 # 不同模型的API地址映射
 MODEL_URL_MAP = {
-    "spark-x": "https://spark-api-open.xf-yun.com/v1/chat/completions",
+    "spark-x": "https://spark-api-open.xf-yun.com/x2/chat/completions",
     "x2": "https://spark-api-open.xf-yun.com/x2/chat/completions",
 }
-DEFAULT_URL = "https://spark-api-open.xf-yun.com/v1/chat/completions"
+DEFAULT_URL = "https://spark-api-open.xf-yun.com/x2/chat/completions"
 DEFAULT_MODEL = "spark-x"
 
 

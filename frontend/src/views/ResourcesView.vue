@@ -100,19 +100,28 @@ const typeLabel = (type) => {
 
 function renderPreview(content) {
   if (!content) return '';
-  return content.slice(0, 200).replace(/[#*`\n]/g, ' ') + (content.length > 200 ? '...' : '');
+  return normalizeMarkdownResource(content).slice(0, 200).replace(/[#*`\n]/g, ' ') + (content.length > 200 ? '...' : '');
+}
+
+function normalizeMarkdownResource(text) {
+  const value = String(text || '').replace(/\r\n/g, '\n').trim();
+  const fencedMatch = value.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```$/i);
+  if (fencedMatch) {
+    return fencedMatch[1].trim();
+  }
+  return value;
 }
 
 function renderMarkdown(text) {
   if (!text) return '';
   try {
-    let html = text;
+    let html = normalizeMarkdownResource(text);
 
     // 【关键】先提取 mermaid 代码块，防止 LaTeX $...$ 误匹配
     const mermaidBlocks = [];
-    html = html.replace(/```mermaid\s*\n([\s\S]*?)```/g, (_, code) => {
+    html = html.replace(/```mermaid\s*(?:\\n|\n)([\s\S]*?)```/g, (_, code) => {
       const id = 'res_mm_' + Math.random().toString(36).slice(2, 8);
-      mermaidBlocks.push({ id, code: code.trim() });
+      mermaidBlocks.push({ id, code: code.replace(/\\n/g, '\n').replace(/\\t/g, '\t').trim() });
       return `<!--MERMAID_${id}-->`;
     });
 
@@ -128,26 +137,6 @@ function renderMarkdown(text) {
     });
 
     html = marked.parse(html);
-
-    // 路径JSON → 渲染流程图
-    html = html.replace(/<pre><code class="language-json">([\s\S]*?)<\/code><\/pre>/g, (_, code) => {
-      try {
-        const data = JSON.parse(code);
-        if (data.nodes && Array.isArray(data.nodes)) {
-          let fhtml = '<div class="flowchart">';
-          for (let i = 0; i < data.nodes.length; i++) {
-            const n = data.nodes[i];
-            fhtml += `<div class="flowchart-layer"><div class="flowchart-node">
-              <div class="flowchart-node-label">${i+1}. ${n.topic}</div>
-              <div class="flowchart-node-time">~${n.estimated_minutes || '?'} 分钟</div>
-            </div></div>`;
-            if (i < data.nodes.length - 1) fhtml += '<div class="flowchart-arrow">↓</div>';
-          }
-          return fhtml + '</div>';
-        }
-      } catch {}
-      return '';
-    });
 
     // 把提取的 mermaid 块还原为占位 div，代码存入 JS Map
     for (const { id, code } of mermaidBlocks) {
@@ -360,13 +349,6 @@ function openCard(idx) {
 .detail-content :deep(blockquote) { border-left: 3px solid var(--accent); margin: 8px 0; padding: 6px 14px; background: #1a1a1a; color: #ccc; border-radius: 0 6px 6px 0; }
 .detail-content :deep(strong) { font-weight: 600; color: #fff; }
 .detail-content :deep(hr) { border: none; border-top: 1px solid #333; margin: 14px 0; }
-/* 流程图 */
-.detail-content :deep(.flowchart) { display: flex; flex-direction: column; align-items: center; padding: 20px 0; margin: 12px 0; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; }
-.detail-content :deep(.flowchart-layer) { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
-.detail-content :deep(.flowchart-node) { background: #222; border: 1px solid #3a3a3a; border-radius: 8px; padding: 10px 18px; min-width: 120px; text-align: center; }
-.detail-content :deep(.flowchart-node-label) { font-size: 13px; font-weight: 600; color: var(--ink); }
-.detail-content :deep(.flowchart-node-time) { font-size: 11px; color: #888; margin-top: 4px; }
-.detail-content :deep(.flowchart-arrow) { text-align: center; font-size: 20px; color: #555; padding: 4px 0; }
 /* 思维导图 */
 .detail-content :deep(.mermaid-block) { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; margin: 10px 0; overflow-x: auto; min-height: 60px; contain: layout; }
 .detail-content :deep(.mermaid-block .mermaid-loading) { font-size: 12px; color: #888; text-align: center; padding: 20px 0; }

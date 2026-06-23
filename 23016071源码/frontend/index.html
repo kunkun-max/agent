@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
+    <title>知途 — 个性化学习多智能体系统</title>
+    <script>
+      (function () {
+        try {
+          var root = document.documentElement;
+          root.style.visibility = 'hidden';
+          var theme = 'dark'; // 强制深色模式
+          root.dataset.theme = theme;
+          var raw = localStorage.getItem('staychat_ui_prefs');
+          var p = raw ? JSON.parse(raw) : {};
+          if (typeof p.accent === 'string' && p.accent[0] === '#') {
+            root.style.setProperty('--accent', p.accent);
+            if (/^#[0-9a-fA-F]{6}$/.test(p.accent)) {
+              root.style.setProperty('--accent-soft', p.accent + '26');
+            }
+          }
+          if (p.glassBlur != null) {
+            var gb = Number(p.glassBlur);
+            if (!isFinite(gb)) gb = 0;
+            if (gb < 0) gb = 0; if (gb > 24) gb = 24;
+            root.style.setProperty('--glass-blur', String(gb) + 'px');
+          }
+          if (p.surfaceAlpha != null) root.style.setProperty('--surface-alpha', String(p.surfaceAlpha));
+          if (p.density === 'compact' || p.density === 'comfort') root.dataset.density = p.density;
+          var shown = false;
+          var show = function () {
+            if (shown) return; shown = true;
+            root.style.visibility = '';
+          };
+          requestAnimationFrame(function () { requestAnimationFrame(show); });
+          setTimeout(show, 1500);
+        } catch (e) {
+          try { document.documentElement.style.visibility = ''; } catch (_) {}
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

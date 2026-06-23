@@ -152,41 +152,6 @@ function getMermaid() {
 const mermaidCache = ref({});
 window.__mermaidCache = mermaidCache.value;
 
-// 流结束后自动渲染所有未渲染的 mermaid 块
-function autoRenderMermaid() {
-  const blocks = document.querySelectorAll('.mermaid-block:not(.rendered):not(.rendering)');
-  if (!blocks.length) return;
-  const mm = getMermaid();
-  if (!mm) return;
-  mm.then(function(mermaid) {
-    blocks.forEach(function(block) {
-      if (block.classList.contains('rendered') || block.classList.contains('rendering')) return;
-      const btn = block.querySelector('.mermaid-render-btn');
-      if (!btn) return;
-      const rawCode = btn.dataset.mermaidCode;
-      if (!rawCode) return;
-      block.classList.add('rendering');
-      const blockId = block.id;
-      mermaid.render(blockId + '_svg', rawCode).then(function(r) {
-        if (r.svg.indexOf('Syntax error') >= 0) { block.classList.remove('rendering'); return; }
-        block.innerHTML = r.svg;
-        block.classList.add('rendered');
-        block.classList.remove('rendering');
-        block.style.cursor = 'zoom-in';
-        if (window.__mermaidCache) window.__mermaidCache[rawCode.trim()] = r.svg;
-        block.onclick = function() {
-          var o = document.getElementById('_zoom_overlay');
-          if (!o) { o = document.createElement('div'); o.id = '_zoom_overlay'; o.style = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.88);display:flex;align-items:center;justify-content:center;cursor:zoom-out'; o.onclick = function() { o.remove(); }; document.body.appendChild(o); }
-          o.innerHTML = '';
-          var b = document.createElement('div'); b.style = 'padding:32px;background:#151515;border-radius:12px;max-width:95vw;max-height:90vh;overflow:auto';
-          b.innerHTML = this.outerHTML; b.querySelector('svg').style = 'min-width:70vw;min-height:60vh;max-width:100%;height:auto';
-          o.appendChild(b);
-        };
-      }).catch(function() { block.classList.remove('rendering'); });
-    });
-  });
-}
-
 const quickActions = [
   { label: '📝 生成讲义', intent: 'generate_doc', msg: '[INTENT:generate_doc]帮我生成一份关于[知识点]的课程讲义' },
   { label: '🧠 思维导图', intent: 'generate_mindmap', msg: '[INTENT:generate_mindmap]帮我画一张[知识点]的思维导图' },
@@ -256,6 +221,8 @@ function finishTyping() {
   isTypingActive.value = false;
   activeTypingMsgId.value = null;
   scrollBottom();
+  // 打字完成后触发 mermaid 渲染
+  setTimeout(() => { getMermaid().then(m => { try { m.run() } catch {} }); }, 50);
 }
 
 function isWaiting(msg) {
@@ -304,6 +271,7 @@ async function send() {
   const assistantMsg = { id: 'a' + Date.now(), text: '', isUser: false, _raw: '' };
   messages.value.push(assistantMsg);
   const msgObj = messages.value[messages.value.length - 1];
+  let assistantRaw = '';
   startTyping(msgObj);
   scrollBottom();
 
@@ -334,13 +302,27 @@ async function send() {
             continue;
           }
           if (parsed.__replace__) {
-            // 后端发来去掉标记的干净版本，同步更新打字机
+            // 保存已渲染的 mermaid SVG（replace后会触发Vue重渲染清掉）
+            const savedSvgs = {};
+            document.querySelectorAll('.mermaid-block.rendered').forEach(el => {
+              savedSvgs[el.id] = el.innerHTML;
+            });
+            assistantRaw = parsed.content;
             if (msgObj._raw !== undefined) msgObj._raw = parsed.content;
             currentFullText = parsed.content;
             if (currentCharIdx > parsed.content.length) {
               currentCharIdx = parsed.content.length;
               msgObj.text = parsed.content;
             }
+            // Vue重渲染后恢复SVG
+            nextTick(() => {
+              Object.entries(savedSvgs).forEach(([id, svg]) => {
+                const el = document.getElementById(id);
+                if (el) { el.innerHTML = svg; el.classList.add('rendered'); el.style.cursor = 'zoom-in'; }
+              });
+              // 未渲染的块重新跑 mermaid.run()
+              getMermaid().then(m => { try { m.run() } catch {} });
+            });
             continue;
           }
           // 过滤意图元数据（正则 + includes双保险）
@@ -359,19 +341,22 @@ async function send() {
             // 过滤内部元数据（后端已过滤，前端兜底）
             const cleanChunk = parsed.content.replace(/___INTENT_META___\{[^}]*\}/g, '');
             if (cleanChunk) msgObj._raw += cleanChunk;
+            if (cleanChunk) assistantRaw += cleanChunk;
           }
         } catch {}
       }
     }
   } catch (err) {
     msgObj._raw = `出错了：${err.message}`;
+    assistantRaw = msgObj._raw;
   } finally {
     streaming.value = false;
-    // 流结束后自动渲染所有未渲染的 mermaid 块（流式分块可能导致正则匹配不到）
-    nextTick(() => { autoRenderMermaid(); });
+    // 流结束后自动渲染 mermaid
+    setTimeout(() => { getMermaid().then(m => { try { m.run() } catch {} }); }, 100);
     // AI回复存到后端（去除画像标记）
-    const cleanText = (msgObj._raw || '').replace(/---PROFILE---[\s\S]*?---END---/g, '').replace(/___INTENT_META___\{[^}]*\}/g, '').trim();
-    console.log('[SAVE-DEBUG] raw_len=%d clean_len=%d intent=%s', msgObj._raw?.length, cleanText.length, detectedIntent);
+    const finalRaw = (assistantRaw || msgObj._raw || '');
+    const cleanText = finalRaw.replace(/---PROFILE---[\s\S]*?---END---/g, '').replace(/___INTENT_META___\{[^}]*\}/g, '').trim();
+    console.log('[SAVE-DEBUG] raw_len=%d clean_len=%d intent=%s', finalRaw.length, cleanText.length, detectedIntent);
     if (cleanText) {
       await saveToServer('assistant', cleanText);
       console.log('[SAVE-DEBUG] assistant 保存完成');
@@ -382,11 +367,11 @@ async function send() {
     if (['generate_doc','generate_mindmap','generate_quiz','generate_code','generate_reading','generate_ppt','generate_all'].includes(detectedIntent)) {
       if (detectedIntent === 'generate_all') {
         // 全套资源：保存完整原始内容（含所有Agent的输出段）
-        if (msgObj._raw && msgObj._raw.length > 120) {
+        if (finalRaw && finalRaw.length > 120) {
           try {
             await apiRequest('/api/resources/save', { method: 'POST', body: {
               resource_type: 'full', topic: detectedTopic, title: (detectedTopic || '学习资料') + ' - 全套资源',
-              content: msgObj._raw, agent: '多Agent协同',
+              content: finalRaw, agent: '多Agent协同',
             }});
             console.log('[RESOURCE] 全套资源已保存');
           } catch (e) { console.error('[RESOURCE] 全套资源保存失败:', e.message); }
@@ -407,24 +392,27 @@ async function send() {
       }
     }
     // 学习路径：提取JSON并保存到 /api/path
-    if (detectedIntent === 'plan_path' && msgObj._raw) {
+    if (detectedIntent === 'plan_path' && finalRaw) {
       try {
-        const raw = msgObj._raw;
-        let jsonStr = raw;
-        const m = raw.match(/```json\s*([\s\S]*?)```/);
-        if (m) jsonStr = m[1];
-        else {
-          const m2 = raw.match(/\{[\s\S]*"nodes"[\s\S]*\}/);
-          if (m2) jsonStr = m2[0];
+        const raw = finalRaw;
+        // 直接找第一个{到最后一个}，避免正则匹配字面量\n的坑
+        const start = raw.indexOf('{');
+        const end = raw.lastIndexOf('}');
+        let jsonStr = '';
+        if (start !== -1 && end > start) {
+          jsonStr = raw.substring(start, end + 1);
         }
-        const pathData = JSON.parse(jsonStr.trim());
+        jsonStr = jsonStr.replace(/\\n/g, '\n').replace(/\\t/g, '\t').trim();
+        if (!jsonStr || !jsonStr.startsWith('{')) throw new Error('未找到JSON');
+        console.log('[PATH] jsonStr长度:', jsonStr.length, '前50:', jsonStr.substring(0, 50));
+        const pathData = JSON.parse(jsonStr);
         if (pathData.nodes && Array.isArray(pathData.nodes)) {
           try {
             await apiRequest('/api/path/save', { method: 'POST', body: pathData });
             console.log('[PATH] 学习路径已保存，节点数:', pathData.nodes.length);
           } catch (e) { console.error('[PATH] 保存失败:', e.message); }
         }
-      } catch (e) { console.log('[PATH] 解析失败:', e.message); }
+      } catch (e) { console.error('[PATH] 解析失败:', e.message, 'jsonStr前50:', jsonStr?.substring(0, 50)); }
     }
   }
 }
@@ -468,9 +456,11 @@ function renderMarkdown(text) {
     let html = text;
     // 【关键】先提取 mermaid 代码块，防止 LaTeX $...$ 误匹配
     const mermaidPlaceholders = [];
-    html = html.replace(/```mermaid\s*\n([\s\S]*?)```/g, (_, code) => {
+    // 匹配真实换行或字面量\n（数据库存储后会变字面量）
+    html = html.replace(/```mermaid\s*(?:\\n|\n)([\s\S]*?)```/g, (_, code) => {
       const key = '__MERMAID_' + mermaidPlaceholders.length + '__';
-      mermaidPlaceholders.push(code);
+      // 字面量\n还原为真实换行
+      mermaidPlaceholders.push(code.replace(/\\n/g, '\n').replace(/\\t/g, '\t'));
       return key;
     });
     // 块级公式 $$...$$
@@ -483,20 +473,41 @@ function renderMarkdown(text) {
       try { return katex.renderToString(formula.trim(), { displayMode: false, throwOnError: false, strict: false }); }
       catch { return `<code>${formula}</code>`; }
     });
-    // 还原 mermaid 占位符
+    // 还原 mermaid 占位符 → 直接生成带按钮的HTML
     mermaidPlaceholders.forEach((code, i) => {
-      html = html.replace('__MERMAID_' + i + '__', '```mermaid\n' + code + '```');
+      const id = 'mermaid_' + Math.random().toString(36).slice(2, 8);
+      const htmlCode = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const blockHtml = '<pre class="mermaid">' + code + '</pre>' +
+        '<button class="mermaid-render-btn" data-mermaid-id="' + id + '" data-mermaid-code="' + htmlCode.replace(/"/g, '&quot;') + '">🖼 渲染图表</button>';
+      html = html.replace('__MERMAID_' + i + '__', '<div class="mermaid-block" id="' + id + '">' + blockHtml + '</div>');
     });
     // 先在marked.parse前提取路径JSON（避免引号被转义导致解析失败）
     let pathNodes = null;
-    html = html.replace(/```json\s*([\s\S]*?)```/g, (_, code) => {
+    html = html.replace(/(?:\\n|\n)*```json\s*(?:\\n|\n)?([\s\S]*?)```/g, (_, code) => {
       try {
-        const data = JSON.parse(code.trim());
-        if (data.nodes && Array.isArray(data.nodes)) {
+        let jsonStr = code.replace(/^\s*\\n/, '').replace(/\\n\s*$/, '').trim();
+        let data;
+        // 1. 直接解析
+        try { data = JSON.parse(jsonStr); } catch {}
+        // 2. 提取第一个{到最后一个}
+        if (!data) {
+          const start = jsonStr.indexOf('{');
+          const end = jsonStr.lastIndexOf('}');
+          if (start !== -1 && end > start) {
+            let extracted = jsonStr.substring(start, end + 1);
+            // 去尾逗号
+            extracted = extracted.replace(/,\s*([}\]])/g, '$1');
+            // 修复未转义的中文引号（LLM常输出 "深度" 这种）
+            // 在JSON字符串值内部，把 "xxx" 替换成「xxx」避免破坏结构
+            extracted = extracted.replace(/(?<=[^\\])"([^"]{1,10})"(?=[^:,\}\]\s])/g, '「$1」');
+            try { data = JSON.parse(extracted); } catch {}
+          }
+        }
+        if (data && data.nodes && Array.isArray(data.nodes)) {
           pathNodes = data.nodes;
           return '';
         }
-      } catch {}
+      } catch (e) { console.log('[PATH] parse error:', e.message); }
       return _;
     });
     html = marked.parse(html);
@@ -505,29 +516,18 @@ function renderMarkdown(text) {
     }
     // 其他JSON数据块 → 隐藏
     html = html.replace(/<pre><code class="language-json">[\s\S]*?<\/code><\/pre>/g, '');
-    // Mermaid 图 — 点击按钮渲染为SVG，缓存避免滚动丢失
-    html = html.replace(/<pre><code class="language-mermaid">([\s\S]*?)<\/code><\/pre>/g, (_, code) => {
-      // 流程图块由路径JSON渲染，跳过不显示按钮
-      if (/^\s*(flowchart|graph)\s/.test(code)) {
-        return '';
-      }
-      var key = code.trim();
-      var cached = window.__mermaidCache ? window.__mermaidCache[key] : null;
-      var id = "mermaid_" + Math.random().toString(36).slice(2, 8);
-      var escCode = code.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
-      var htmlCode = code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-      if (cached) {
-        nextTick(function() {
-          var el = document.getElementById(id);
-          if (el) { el.innerHTML = cached; el.classList.add("rendered"); el.style.cursor = "zoom-in"; }
-        });
-        return '<div class="mermaid-block rendered" id="' + id + '" style="cursor:zoom-in" onclick="var o=document.getElementById(\'_zoom_overlay\');if(!o){o=document.createElement(\'div\');o.id=\'_zoom_overlay\';o.style=\'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.88);display:flex;align-items:center;justify-content:center;cursor:zoom-out\';o.onclick=function(){o.remove()};document.body.appendChild(o)}o.innerHTML=\'\';var b=document.createElement(\'div\');b.style=\'padding:32px;background:#151515;border-radius:12px;max-width:95vw;max-height:90vh;overflow:auto\';b.innerHTML=this.querySelector(\'svg\').outerHTML.replace(\'<svg\',\'<svg style=min-width:70vw;min-height:60vh;max-width:100%;height:auto\');o.appendChild(b)"></div>';
-      }
-      return '<div class="mermaid-block" id="' + id + '">' +
-        '<pre><code>' + htmlCode + '</code></pre>' +
-        '<button class="mermaid-render-btn" data-mermaid-id="' + id + '" data-mermaid-code="' + htmlCode + '">🖼 渲染图表</button>' +
-        '</div>';
-    });
+    // 触发 mermaid 渲染（延迟确保 DOM 更新完成）
+    setTimeout(() => {
+      getMermaid().then(m => {
+        try {
+          // 只渲染未处理的 pre.mermaid 元素
+          document.querySelectorAll('pre.mermaid:not([data-processed])').forEach(el => {
+            el.setAttribute('data-processed', 'true');
+          });
+          m.run();
+        } catch {}
+      });
+    }, 200);
     return html;
   } catch { return text; }
 }
@@ -556,130 +556,54 @@ function renderPathChart(nodes) {
   return html;
 }
 
-// ===== 路径图专用：纯CSS盒子+箭头 =====
-function renderFlowchart(code) {
-  // 流程图（flowchart/graph）→ 盒子+箭头
-  const lines = code.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('flowchart') && !l.startsWith('graph'));
-  const nodes = {};  // { id: { label, children: [] } }
-  const roots = new Set();
-  const children = new Set();
-
-  for (const line of lines) {
-    // 解析 "1[标签] --> 2[标签]" 或 "1 --> 2"
-    const parts = line.split(/-->|---|->/);
-    if (parts.length < 2) continue;
-
-    const parseNode = (s) => {
-      s = s.trim();
-      const m = s.match(/^(\w+)\[(.+)\]$/);
-      if (m) return { id: m[1], label: m[2].replace(/<br\s*\/?>/g, '\n') };
-      return { id: s, label: s };
-    };
-
-    const from = parseNode(parts[0]);
-    const to = parseNode(parts[1]);
-
-    if (!nodes[from.id]) nodes[from.id] = { label: from.label, children: [] };
-    else if (from.label !== from.id) nodes[from.id].label = from.label;
-    if (!nodes[to.id]) nodes[to.id] = { label: to.label, children: [] };
-    else if (to.label !== to.id) nodes[to.id].label = to.label;
-
-    nodes[from.id].children.push(to.id);
-    roots.add(from.id);
-    children.add(to.id);
-  }
-
-  // 找出根节点（没有父节点的）
-  const rootIds = [...roots].filter(id => !children.has(id));
-  if (rootIds.length === 0 && Object.keys(nodes).length > 0) rootIds.push(Object.keys(nodes)[0]);
-
-  // BFS 分层布局
-  const visited = new Set();
-  const layers = [];
-  let current = rootIds;
-  while (current.length > 0) {
-    layers.push(current);
-    const next = [];
-    for (const id of current) {
-      if (visited.has(id)) continue;
-      visited.add(id);
-      for (const child of (nodes[id]?.children || [])) {
-        if (!visited.has(child)) next.push(child);
-      }
-    }
-    current = [...new Set(next)];
-  }
-
-  // 渲染为 HTML
-  let html = '<div class="flowchart">';
-  for (let i = 0; i < layers.length; i++) {
-    html += '<div class="flowchart-layer">';
-    for (const id of layers[i]) {
-      const node = nodes[id];
-      if (!node) continue;
-      const labelLines = node.label.split('\n');
-      html += `<div class="flowchart-node">
-        <div class="flowchart-node-label">${labelLines[0]}</div>
-        ${labelLines[1] ? `<div class="flowchart-node-time">${labelLines[1]}</div>` : ''}
-      </div>`;
-    }
-    html += '</div>';
-    // 层间箭头
-    if (i < layers.length - 1) {
-      html += '<div class="flowchart-arrow">↓</div>';
-    }
-  }
-  html += '</div>';
-  return html;
-}
-
 onMounted(async () => {
   await loadHistory();
   scrollBottom();
-  // 监听滚动：距离底部超过200px时显示"回到底部"按钮
   nextTick(() => {
     const el = msgListRef.value;
     if (el) {
       el.addEventListener('scroll', () => {
         showScrollBtn.value = (el.scrollHeight - el.scrollTop - el.clientHeight) > 200;
-        // 滚动到顶部附近 → 加载更多历史
         if (el.scrollTop < 80 && !historyLoading.value && !historyFullyLoaded.value) {
           loadMoreHistory();
         }
       }, { passive: true });
-      // 委托：Mermaid 渲染按钮
+      // 委托：Mermaid 渲染按钮点击 → 手动渲染
       el.addEventListener('click', (e) => {
         const btn = e.target.closest('.mermaid-render-btn');
-        if (!btn) return;
-        e.preventDefault();
-        const blockId = btn.dataset.mermaidId;
-        const block = document.getElementById(blockId);
-        if (!block || block.classList.contains('rendered') || block.classList.contains('rendering')) return;
-        block.classList.add('rendering');
-        const rawCode = btn.dataset.mermaidCode;
-        const mm = getMermaid();
-        if (!mm) return;
-        mm.then(function(mermaid) {
-          return mermaid.render(blockId + '_svg', rawCode);
-        }).then(function(r) {
-          if (r.svg.indexOf('Syntax error') >= 0) { block.classList.remove('rendering'); return; }
-          block.innerHTML = r.svg;
-          block.classList.add('rendered');
-          block.classList.remove('rendering');
-          block.style.cursor = 'zoom-in';
-          block.scrollIntoView({ block: 'nearest', behavior: 'instant' });
-          if (window.__mermaidCache) window.__mermaidCache[rawCode.trim()] = r.svg;
-          block.onclick = function() {
-            var o = document.getElementById('_zoom_overlay');
-            if (!o) { o = document.createElement('div'); o.id = '_zoom_overlay'; o.style = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.88);display:flex;align-items:center;justify-content:center;cursor:zoom-out'; o.onclick = function() { o.remove(); }; document.body.appendChild(o); }
-            o.innerHTML = '';
-            var b = document.createElement('div'); b.style = 'padding:32px;background:#151515;border-radius:12px;max-width:95vw;max-height:90vh;overflow:auto';
-            b.innerHTML = this.outerHTML; b.querySelector('svg').style = 'min-width:70vw;min-height:60vh;max-width:100%;height:auto';
-            o.appendChild(b);
-          };
-        }).catch(function() { block.classList.remove('rendering'); });
+        if (btn) {
+          e.preventDefault();
+          const blockId = btn.dataset.mermaidId;
+          const block = document.getElementById(blockId);
+          if (!block || block.classList.contains('rendered') || block.classList.contains('rendering')) return;
+          block.classList.add('rendering');
+          const rawCode = btn.dataset.mermaidCode;
+          const code = rawCode.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
+          getMermaid().then(function(mermaid) {
+            return mermaid.render(blockId + '_svg', code);
+          }).then(function(r) {
+            if (r.svg.indexOf('Syntax error') >= 0) { block.classList.remove('rendering'); return; }
+            block.innerHTML = r.svg;
+            block.classList.add('rendered');
+            block.classList.remove('rendering');
+            block.style.cursor = 'zoom-in';
+            if (window.__mermaidCache) window.__mermaidCache[code.trim()] = r.svg;
+          }).catch(function() { block.classList.remove('rendering'); });
+          return;
+        }
+        // SVG 点击放大（mermaid渲染后的SVG）
+        const svg = e.target.closest('.mermaid-block.rendered svg, .mermaid-block svg');
+        if (svg) {
+          e.preventDefault();
+          var o = document.getElementById('_zoom_overlay');
+          if (!o) { o = document.createElement('div'); o.id = '_zoom_overlay'; o.style = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.88);display:flex;align-items:center;justify-content:center;cursor:zoom-out'; o.onclick = function() { o.remove(); }; document.body.appendChild(o); }
+          o.innerHTML = '';
+          var b = document.createElement('div'); b.style = 'padding:32px;background:#151515;border-radius:12px;max-width:95vw;max-height:90vh;overflow:auto';
+          b.innerHTML = svg.outerHTML.replace('<svg', '<svg style="min-width:70vw;min-height:60vh;max-width:100%;height:auto"');
+          o.appendChild(b);
+        }
       });
-      }
+    }
   });
 });
 onBeforeUnmount(() => { stopTyping(true); });
